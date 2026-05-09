@@ -1,0 +1,375 @@
+`timescale 1ns / 1ps
+
+module ultrasonic_test (
+    input  clk,
+    input  [1:0] btn,
+    inout  [7:0] ja,
+    output reg [3:0] led,
+
+    output pio1, output pio2, output pio3,
+    output pio4, output pio5, output pio6,
+    output uart_tx
+);
+
+parameter TRIG_PULSE = 24'd120;
+parameter SENSOR_GAP = 24'd70_000;  // 12MHz 기준 ~5.8ms
+
+parameter CLOSE_THR = 24'd7_060;
+parameter MID_THR   = 24'd14_120;
+parameter FAR_THR   = 24'd21_180;
+parameter CLK_PER_BIT = 13'd1250;
+
+reg trig0 = 0;
+
+wire echo0 = ja[1];
+
+assign ja[0] = trig0;
+assign ja[2] = 1'bz;
+assign ja[3] = 1'bz;
+assign ja[4] = 1'bz;
+assign ja[5] = 1'bz;
+assign ja[6] = 1'bz;
+assign ja[7] = 1'bz;
+
+wire buzzer0;
+wire servo0;
+
+assign pio1 = buzzer0;
+assign pio2 = 1'b0;
+assign pio3 = 1'b0;
+
+assign pio4 = servo0;
+assign pio5 = 1'b0;
+assign pio6 = 1'b0;
+
+wire [7:0] angle0;
+
+// =====================================================
+// Sensor0 Trigger Only
+// =====================================================
+reg [23:0] seq_cnt  = 0;
+reg        send_req = 0;
+
+always @(posedge clk) begin
+    send_req <= 0;
+    trig0 <= 0;
+
+    if (seq_cnt < TRIG_PULSE) begin
+        trig0 <= 1;
+    end
+
+    if (seq_cnt >= SENSOR_GAP - 1) begin
+        seq_cnt <= 0;
+        send_req <= 1;
+    end
+    else begin
+        seq_cnt <= seq_cnt + 1;
+    end
+end
+
+// =====================================================
+// Echo Measure D0 Only
+// =====================================================
+wire [23:0] echo_time0;
+wire [15:0] dist0;
+
+echo_measure U_ECHO0(
+    .clk(clk),
+    .trig(trig0),
+    .echo(echo0),
+    .echo_time(echo_time0),
+    .dist_cm(dist0)
+);
+
+// =====================================================
+// LED
+// =====================================================
+always @(posedge clk) begin
+    if      (echo_time0 == 0)        led <= 4'b0000;
+    else if (echo_time0 < CLOSE_THR) led <= 4'b0001;
+    else if (echo_time0 < MID_THR)   led <= 4'b0011;
+    else if (echo_time0 < FAR_THR)   led <= 4'b0111;
+    else                             led <= 4'b1111;
+end
+
+// =====================================================
+// Buzzer0 Only
+// =====================================================
+buzzer_ctrl U_BUZ0(
+    .clk(clk),
+    .echo_time(echo_time0),
+    .buzzer(buzzer0)
+);
+
+// =====================================================
+// Servo0 Only
+// =====================================================
+servo_sweep_angle U_SERVO0(
+    .clk(clk),
+    .servo_pwm(servo0),
+    .angle(angle0)
+);
+
+// =====================================================
+// UART
+// Format: A=000 D0=000
+// =====================================================
+reg uart_start = 0;
+reg [7:0] uart_data = 0;
+wire uart_busy;
+
+uart_tx_module #(.CLK_PER_BIT(CLK_PER_BIT)) U_UART(
+    .clk(clk),
+    .start(uart_start),
+    .data(uart_data),
+    .tx(uart_tx),
+    .busy(uart_busy)
+);
+
+reg [5:0]  state = 0;
+reg [7:0]  a0 = 0;
+reg [15:0] d0 = 0;
+reg        pending_send = 0;
+
+always @(posedge clk) begin
+    uart_start <= 0;
+
+    if (send_req) pending_send <= 1;
+
+    if (!uart_busy && !uart_start) begin
+        case (state)
+            0: begin
+                if (pending_send) begin
+                    pending_send <= 0;
+                    a0 <= angle0;
+                    d0 <= dist0;
+                    state <= 1;
+                end
+            end
+
+            1:  begin uart_data <= "A";               uart_start <= 1; state <= 2;  end
+            2:  begin uart_data <= "=";               uart_start <= 1; state <= 3;  end
+            3:  begin uart_data <= ((a0/100)%10)+"0"; uart_start <= 1; state <= 4;  end
+            4:  begin uart_data <= ((a0/10)%10)+"0";  uart_start <= 1; state <= 5;  end
+            5:  begin uart_data <= (a0%10)+"0";       uart_start <= 1; state <= 6;  end
+            6:  begin uart_data <= " ";               uart_start <= 1; state <= 7;  end
+
+            7:  begin uart_data <= "D";               uart_start <= 1; state <= 8;  end
+            8:  begin uart_data <= "0";               uart_start <= 1; state <= 9;  end
+            9:  begin uart_data <= "=";               uart_start <= 1; state <= 10; end
+            10: begin uart_data <= ((d0/100)%10)+"0"; uart_start <= 1; state <= 11; end
+            11: begin uart_data <= ((d0/10)%10)+"0";  uart_start <= 1; state <= 12; end
+            12: begin uart_data <= (d0%10)+"0";       uart_start <= 1; state <= 13; end
+
+            13: begin uart_data <= 8'h0D;             uart_start <= 1; state <= 14; end
+            14: begin uart_data <= 8'h0A;             uart_start <= 1; state <= 0;  end
+
+            default: state <= 0;
+        endcase
+    end
+end
+
+endmodule
+
+// =====================================================
+// Echo Measure Module
+// =====================================================
+module echo_measure(
+    input clk,
+    input trig,
+    input echo,
+    output reg [23:0] echo_time = 0,
+    output reg [15:0] dist_cm = 0
+);
+
+reg [23:0] echo_cnt = 0;
+reg measuring = 0;
+
+always @(posedge clk) begin
+    if (trig) begin
+        echo_cnt  <= 0;
+        measuring <= 0;
+    end
+    else if (echo) begin
+        if (echo_cnt < 24'd1_000_000)
+            echo_cnt <= echo_cnt + 1;
+        measuring <= 1;
+    end
+    else if (measuring) begin
+        echo_time <= echo_cnt;
+        dist_cm   <= echo_cnt / 706;
+        echo_cnt  <= 0;
+        measuring <= 0;
+    end
+end
+
+endmodule
+
+// =====================================================
+// Buzzer Module
+// =====================================================
+module buzzer_ctrl(
+    input clk,
+    input [23:0] echo_time,
+    output reg buzzer = 0
+);
+
+parameter CLOSE_THR = 24'd7_060;
+parameter MID_THR   = 24'd14_120;
+parameter BEEP_FAST = 23'd600;
+parameter BEEP_SLOW = 23'd6_000;
+
+reg [22:0] beep_cnt = 0;
+reg [22:0] beep_thr = BEEP_FAST;
+reg beep_en = 0;
+
+always @(posedge clk) begin
+    if (echo_time > 0 && echo_time < CLOSE_THR) begin
+        beep_en <= 1;
+        beep_thr <= BEEP_FAST;
+    end
+    else if (echo_time > 0 && echo_time < MID_THR) begin
+        beep_en <= 1;
+        beep_thr <= BEEP_SLOW;
+    end
+    else begin
+        beep_en <= 0;
+    end
+
+    if (!beep_en) begin
+        buzzer <= 0;
+        beep_cnt <= 0;
+    end
+    else if (beep_cnt >= beep_thr) begin
+        beep_cnt <= 0;
+        buzzer <= ~buzzer;
+    end
+    else begin
+        beep_cnt <= beep_cnt + 1;
+    end
+end
+
+endmodule
+
+// =====================================================
+// Servo Sweep + Angle Module
+// 원래 가감속 구조 유지
+// =====================================================
+module servo_sweep_angle(
+    input clk,
+    output reg servo_pwm = 0,
+    output reg [7:0] angle = 0
+);
+
+parameter SERVO_PERIOD = 18'd240_000;
+parameter SERVO_LEFT   = 18'd9_000;
+parameter SERVO_RIGHT  = 18'd27_000;
+
+parameter STEP_FAST = 24'd1_200;
+parameter STEP_MID  = 24'd4_000;
+parameter STEP_SLOW = 24'd13_000;
+
+parameter SLOW_ZONE = 18'd2_000;
+parameter MID_ZONE  = 18'd5_000;
+
+reg [17:0] servo_cnt   = 0;
+reg [17:0] servo_width = SERVO_LEFT;
+reg [23:0] step_cnt    = 0;
+reg [23:0] step_delay  = STEP_FAST;
+reg        direction   = 0;
+
+always @(posedge clk) begin
+    if (servo_cnt >= SERVO_PERIOD - 1)
+        servo_cnt <= 0;
+    else
+        servo_cnt <= servo_cnt + 1;
+
+    servo_pwm <= (servo_cnt < servo_width);
+end
+
+always @(posedge clk) begin
+    if (direction == 0) begin
+        if      (servo_width >= SERVO_RIGHT - SLOW_ZONE) step_delay <= STEP_SLOW;
+        else if (servo_width >= SERVO_RIGHT - MID_ZONE)  step_delay <= STEP_MID;
+        else                                             step_delay <= STEP_FAST;
+    end
+    else begin
+        if      (servo_width <= SERVO_LEFT + SLOW_ZONE) step_delay <= STEP_SLOW;
+        else if (servo_width <= SERVO_LEFT + MID_ZONE)  step_delay <= STEP_MID;
+        else                                            step_delay <= STEP_FAST;
+    end
+
+    if (step_cnt >= step_delay) begin
+        step_cnt <= 0;
+
+        if (direction == 0) begin
+            if (servo_width < SERVO_RIGHT)
+                servo_width <= servo_width + 1;
+            else
+                direction <= 1;
+        end
+        else begin
+            if (servo_width > SERVO_LEFT)
+                servo_width <= servo_width - 1;
+            else
+                direction <= 0;
+        end
+
+        angle <= ((servo_width - SERVO_LEFT) * 120)
+         / (SERVO_RIGHT - SERVO_LEFT);
+    end
+    else begin
+        step_cnt <= step_cnt + 1;
+    end
+end
+
+endmodule
+
+// =====================================================
+// UART TX Module
+// =====================================================
+module uart_tx_module #(
+    parameter CLK_PER_BIT = 1250
+)(
+    input clk,
+    input start,
+    input [7:0] data,
+    output reg tx = 1,
+    output reg busy = 0
+);
+
+reg [12:0] clk_cnt = 0;
+reg [3:0]  bit_idx = 0;
+reg [9:0]  tx_data = 10'b1111111111;
+
+always @(posedge clk) begin
+    if (!busy) begin
+        tx <= 1;
+
+        if (start) begin
+            busy <= 1;
+            clk_cnt <= 0;
+            bit_idx <= 0;
+            tx_data <= {1'b1, data, 1'b0};
+        end
+    end
+    else begin
+        if (clk_cnt >= CLK_PER_BIT - 1) begin
+            clk_cnt <= 0;
+            tx <= tx_data[bit_idx];
+
+            if (bit_idx >= 9) begin
+                busy <= 0;
+                bit_idx <= 0;
+            end
+            else begin
+                bit_idx <= bit_idx + 1;
+            end
+        end
+        else begin
+            clk_cnt <= clk_cnt + 1;
+        end
+    end
+end
+
+endmodule

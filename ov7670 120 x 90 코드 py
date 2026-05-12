@@ -1,0 +1,92 @@
+import serial
+import numpy as np
+import matplotlib.pyplot as plt
+
+PORT = "COM4"
+BAUD = 115200
+
+HEADER = bytes([0xAA, 0x55])
+WIDTH = 120
+HEIGHT = 90
+FRAME_SIZE = WIDTH * HEIGHT
+
+ser = serial.Serial(PORT, BAUD, timeout=2)
+
+plt.ion()
+fig, ax = plt.subplots(figsize=(8, 6))
+img = ax.imshow(
+    np.zeros((HEIGHT, WIDTH), dtype=np.uint8),
+    cmap="gray",
+    vmin=0,
+    vmax=255,
+    interpolation="nearest",
+)
+ax.set_title("OV7670 UART Preview")
+ax.axis("off")
+
+
+def read_exact(n):
+    data = bytearray()
+
+    while len(data) < n:
+        chunk = ser.read(n - len(data))
+        if not chunk:
+            return None
+        data.extend(chunk)
+
+    return bytes(data)
+
+
+def find_header():
+    last = None
+
+    while True:
+        b = ser.read(1)
+
+        if not b:
+            return False
+
+        value = b[0]
+
+        if last == 0xAA and value == 0x55:
+            return True
+
+        last = value
+
+
+try:
+    while True:
+        if not find_header():
+            continue
+
+        wh = read_exact(2)
+        if wh is None:
+            continue
+
+        w = wh[0]
+        h = wh[1]
+
+        if w != WIDTH or h != HEIGHT:
+            print(f"bad frame size: {w}x{h}")
+            continue
+
+        payload = read_exact(FRAME_SIZE)
+        if payload is None:
+            print("timeout while reading frame")
+            continue
+
+        frame = np.frombuffer(payload, dtype=np.uint8).reshape((HEIGHT, WIDTH))
+
+        lo, hi = np.percentile(frame, (2, 98))
+        frame = np.clip((frame - lo) * 255.0 / max(1, hi - lo), 0, 255).astype(np.uint8)
+
+        img.set_data(frame)
+
+        ax.set_title(f"OV7670 UART Preview | {WIDTH}x{HEIGHT}")
+        plt.pause(0.001)
+
+except KeyboardInterrupt:
+    print("\n프로그램 종료")
+
+finally:
+    ser.close()
